@@ -33,12 +33,15 @@ function findClaudeCLI(): string | null {
 
 /**
  * Build a shell command string for `claude -p`.
- * Escapes the prompt for safe shell embedding.
+ * The prompt is NOT embedded in the command — it is passed via stdin by the
+ * caller (see createCLIQueryFn). This avoids hitting ARG_MAX (E2BIG) for large
+ * prompts such as those produced by IDEs/agents that include repo maps and
+ * file context.
  */
 function buildCLICommand(cliBin: string, prompt: string, opts: Record<string, unknown>): string {
-  // Shell-escape single quotes in prompt
-  const safePrompt = prompt.replace(/'/g, "'\\''");
-  const parts = [cliBin, "-p", `'${safePrompt}'`, "--output-format", "stream-json", "--verbose"];
+  // Prompt is fed via stdin; do not place it on the command line.
+  void prompt;
+  const parts = [cliBin, "-p", "--output-format", "stream-json", "--verbose"];
 
   if (opts.model) parts.push("--model", String(opts.model));
   if (opts.systemPrompt) {
@@ -80,6 +83,10 @@ function buildCLICommand(cliBin: string, prompt: string, opts: Record<string, un
  * shell and the Bun-compiled `claude` binary historically had stdout-piping
  * quirks with direct `spawn`. Using a shell preserves the previous behavior
  * while making the call cancellable.
+ *
+ * The prompt (if any) is written to the child's stdin via the `input` option
+ * rather than being placed on the command line, so that large prompts do not
+ * exceed the OS ARG_MAX limit (E2BIG).
  */
 export interface SpawnWithAbortOptions {
   cwd?: string;
@@ -88,6 +95,8 @@ export interface SpawnWithAbortOptions {
   timeoutMs: number;
   /** Grace period between SIGTERM and SIGKILL. Default 5s. */
   killGraceMs?: number;
+  /** Data to write to the child's stdin (e.g. the prompt). */
+  input?: string;
   /** Test-only injection hook. */
   spawnFn?: typeof spawn;
 }
@@ -102,8 +111,18 @@ export function spawnWithAbort(cmd: string, opts: SpawnWithAbortOptions): Promis
       cwd: opts.cwd,
       env: process.env,
       detached: process.platform !== "win32",
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: [opts.input != null ? "pipe" : "ignore", "pipe", "pipe"],
     });
+
+    // Feed the prompt to the child via stdin. Guard against EPIPE in case the
+    // child exits before consuming all input.
+    if (opts.input != null && child.stdin) {
+      child.stdin.on("error", () => {
+        // Child closed stdin early — ignore (e.g. EPIPE).
+      });
+      child.stdin.write(opts.input);
+      child.stdin.end();
+    }
 
     const stdoutChunks: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
@@ -186,6 +205,9 @@ export function spawnWithAbort(cmd: string, opts: SpawnWithAbortOptions): Promis
  * This implementation uses `spawn` through `sh -c '<cmd>'`, which preserves
  * the shell-piping path that worked for execSync while making the child
  * killable on abort. See `spawnWithAbort` for the signal handling.
+ *
+ * The prompt is fed to claude via stdin (not argv) so that large prompts do
+ * not exceed the OS ARG_MAX limit (E2BIG).
  */
 function createCLIQueryFn(cliBin: string): QueryFn {
   return function cliQuery(args: { prompt: unknown; options: Record<string, unknown> }): AsyncIterable<Record<string, unknown>> {
@@ -204,6 +226,7 @@ function createCLIQueryFn(cliBin: string): QueryFn {
           cwd: opts.cwd ? String(opts.cwd) : undefined,
           abortController: ac,
           timeoutMs,
+          input: prompt,
         });
 
         // Parse the NDJSON output line by line and yield each event
